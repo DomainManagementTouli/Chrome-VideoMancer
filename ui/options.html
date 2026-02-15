@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=800, initial-scale=1.0">
+  <title>VideoMancer Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <img src="../icons/icon48.png" alt="VideoMancer" class="logo">
+      <div>
+        <h1>VideoMancer Settings</h1>
+        <p class="subtitle">Configure video detection and download preferences</p>
+      </div>
+    </header>
+
+    <main>
+      <!-- General Settings -->
+      <section class="settings-section">
+        <h2>General</h2>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="auto-detect">Auto-detect videos</label>
+            <p class="setting-desc">Automatically scan pages for video content as you browse</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="auto-detect" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="show-notifications">Show notifications</label>
+            <p class="setting-desc">Display a notification when videos are first detected on a page</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="show-notifications" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </section>
+
+      <!-- Download Settings -->
+      <section class="settings-section">
+        <h2>Downloads</h2>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="preferred-quality">Preferred quality</label>
+            <p class="setting-desc">Default quality selection for HLS/DASH streams</p>
+          </div>
+          <select id="preferred-quality">
+            <option value="highest">Highest available</option>
+            <option value="1080p">1080p</option>
+            <option value="720p">720p</option>
+            <option value="480p">480p</option>
+            <option value="lowest">Lowest (save bandwidth)</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="max-concurrent">Max concurrent downloads</label>
+            <p class="setting-desc">Number of segments to download simultaneously for HLS/DASH</p>
+          </div>
+          <select id="max-concurrent">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3" selected>3</option>
+            <option value="5">5</option>
+            <option value="8">8</option>
+            <option value="10">10</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="min-size">Minimum file size (KB)</label>
+            <p class="setting-desc">Ignore video files smaller than this (helps filter out ads/thumbnails)</p>
+          </div>
+          <input type="number" id="min-size" value="100" min="0" max="10000" step="50">
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="filename-template">Filename template</label>
+            <p class="setting-desc">Available variables: {title}, {quality}, {date}, {domain}</p>
+          </div>
+          <input type="text" id="filename-template" value="{title} - {quality}" placeholder="{title} - {quality}">
+        </div>
+      </section>
+
+      <!-- Blacklist -->
+      <section class="settings-section">
+        <h2>Domain Blacklist</h2>
+        <p class="section-desc">Videos from these domains will be ignored. One domain per line. Useful for filtering out ad networks.</p>
+
+        <textarea id="blacklist" rows="6" placeholder="doubleclick.net&#10;googlesyndication.com&#10;adservice.google.com"></textarea>
+
+        <div class="preset-buttons">
+          <button id="btn-add-ad-domains" class="btn-secondary">Add common ad domains</button>
+          <button id="btn-clear-blacklist" class="btn-secondary btn-danger">Clear all</button>
+        </div>
+      </section>
+
+      <!-- About -->
+      <section class="settings-section">
+        <h2>About</h2>
+        <div class="about-info">
+          <p><strong>VideoMancer</strong> v1.0.0</p>
+          <p>Detect and download videos from any web page. Supports HLS, DASH, MP4, WebM, and more.</p>
+          <p class="about-features">
+            <strong>Supported formats:</strong> MP4, WebM, MKV, AVI, MOV, FLV, M4V, TS, OGV, 3GP<br>
+            <strong>Streaming protocols:</strong> HLS (m3u8), DASH (MPD)<br>
+            <strong>Audio formats:</strong> MP3, AAC, OGG, WAV, FLAC, M4A, OPUS
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <button id="btn-save" class="btn-primary">Save Settings</button>
+      <button id="btn-reset" class="btn-secondary">Reset to Defaults</button>
+      <span id="save-status"></span>
+    </footer>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
