@@ -129,13 +129,34 @@
     });
 
     // data-* attributes that may contain video URLs
-    document.querySelectorAll('[data-video-url], [data-src], [data-video-src], [data-hls], [data-dash], [data-stream-url]').forEach((el) => {
-      const attrs = ['data-video-url', 'data-src', 'data-video-src', 'data-hls', 'data-dash', 'data-stream-url'];
+    document.querySelectorAll('[data-video-url], [data-src], [data-video-src], [data-hls], [data-dash], [data-stream-url], [data-manifest], [data-source], [data-bitmovin-source]').forEach((el) => {
+      const attrs = ['data-video-url', 'data-src', 'data-video-src', 'data-hls', 'data-dash', 'data-stream-url', 'data-manifest', 'data-source', 'data-bitmovin-source'];
       for (const attr of attrs) {
         const val = el.getAttribute(attr);
         if (val && (isVideoUrl(val) || /^https?:\/\//i.test(val))) {
           registerUrl(val);
         }
+      }
+    });
+
+    // Look for Bitmovin player containers and try to extract player instance
+    document.querySelectorAll('[id*="bitmovin"], [id*="player"]').forEach((el) => {
+      // Check if there's a video element inside with a blob src
+      const videoEl = el.querySelector('video[src^="blob:"]');
+      if (videoEl && !videoEl._vmScanned) {
+        videoEl._vmScanned = true;
+        // The video is playing through MSE — the manifest URL will be captured
+        // by our injected.js fetch/XHR intercepts. Register the blob video
+        // so the user sees it in the popup.
+        sendToBackground({
+          url: videoEl.src,
+          type: 'mse-blob',
+          filename: document.title || 'video',
+          resolution: videoEl.videoWidth && videoEl.videoHeight
+            ? `${videoEl.videoWidth}x${videoEl.videoHeight}` : null,
+          duration: videoEl.duration && isFinite(videoEl.duration) ? videoEl.duration : null,
+          isBlobVideo: true,
+        });
       }
     });
   }

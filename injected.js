@@ -1,10 +1,11 @@
 /**
  * VideoMancer - Injected Page Script
  * Runs in the page context (not extension context) to intercept:
- * - XMLHttpRequest / fetch for video URLs
+ * - XMLHttpRequest / fetch for video URLs AND response bodies containing manifest URLs
  * - MediaSource / SourceBuffer for MSE streams
  * - Video element src assignments
- * - HLS.js / dash.js / video.js player libraries
+ * - Bitmovin Player (used by The Great Courses / Wondrium, etc.)
+ * - HLS.js / dash.js / video.js / Shaka Player / JW Player libraries
  */
 
 (function () {
@@ -28,14 +29,56 @@
   }
 
   function isVideoUrl(url) {
-    return /\.(mp4|webm|mkv|m4v|ts|m3u8?|mpd|flv|mov|3gp|ogv)(\?|#|$)/i.test(url);
+    return /\.(mp4|webm|mkv|m4v|ts|m3u8?|mpd|flv|mov|3gp|ogv|m4s|fmp4|cmfv|cmfa)(\?|#|$)/i.test(url);
+  }
+
+  function isManifestUrl(url) {
+    return /\.(m3u8?|mpd)(\?|#|$)/i.test(url);
   }
 
   function isVideoMimeType(type) {
     return /^(video\/|application\/x-mpegurl|application\/vnd\.apple\.mpegurl|application\/dash\+xml)/i.test(type);
   }
 
+  function classifyMediaUrl(url) {
+    if (/\.m3u8?(\?|#|$)/i.test(url)) return 'hls';
+    if (/\.mpd(\?|#|$)/i.test(url)) return 'dash';
+    return 'direct';
+  }
+
+  /**
+   * Scan a string (JSON response body, inline script, etc.) for embedded
+   * manifest/video URLs. This is critical for sites like The Great Courses
+   * where Bitmovin Player receives its manifest URL from an API response.
+   */
+  function scanTextForVideoUrls(text) {
+    if (!text || text.length > 2000000) return; // skip very large responses
+
+    // Direct URL patterns for manifests and video files
+    const urlRegex = /["'](https?:\/\/[^"'\s<>]+?\.(m3u8?|mpd|mp4|webm|m4v|ts)(\?[^"'\s<>]*)?)["']/gi;
+    let match;
+    while ((match = urlRegex.exec(text)) !== null) {
+      const url = match[1];
+      notify(url, { mediaType: classifyMediaUrl(url) });
+    }
+
+    // Also look for unquoted URLs in common JSON patterns:
+    // "dash": "https://...", "hls": "https://...", "manifest": "https://..."
+    const jsonUrlRegex = /["']((?:dash|hls|manifest|stream|video|source|playback|content)(?:_url|Url|URL|_uri|Uri|URI)?)\s*["']\s*:\s*["'](https?:\/\/[^"'\s<>]+)["']/gi;
+    while ((match = jsonUrlRegex.exec(text)) !== null) {
+      const url = match[2];
+      const key = match[1].toLowerCase();
+      const type = key.includes('dash') || key.includes('mpd') ? 'dash'
+        : key.includes('hls') || key.includes('m3u') ? 'hls'
+        : null;
+      notify(url, { mediaType: type });
+    }
+  }
+
   // ── Intercept fetch() ──────────────────────────────────────────────────
+  // Intercepts BOTH the request URL and the response body. The response
+  // body scan is critical for sites where an API returns a JSON object
+  // containing the actual manifest URL.
 
   const originalFetch = window.fetch;
   window.fetch = function (...args) {
@@ -45,19 +88,30 @@
     if (url && isVideoUrl(url)) {
       try {
         const fullUrl = new URL(url, window.location.href).href;
-        notify(fullUrl);
+        notify(fullUrl, { mediaType: classifyMediaUrl(fullUrl) });
       } catch { /* ignore */ }
     }
 
     return originalFetch.apply(this, args).then(response => {
-      // Check response content-type
       const ct = response.headers.get('content-type') || '';
+
+      // Check if the response itself is a video/manifest
       if (url && isVideoMimeType(ct)) {
         try {
           const fullUrl = new URL(url, window.location.href).href;
           notify(fullUrl, { mediaType: ct.includes('mpegurl') ? 'hls' : ct.includes('dash') ? 'dash' : 'direct' });
         } catch { /* ignore */ }
       }
+
+      // For JSON/text API responses, clone and scan the body for manifest URLs.
+      // This catches: API calls that return { "hls": "https://cdn.../manifest.m3u8" }
+      if (ct.includes('json') || ct.includes('text')) {
+        const cloned = response.clone();
+        cloned.text().then(body => {
+          scanTextForVideoUrls(body);
+        }).catch(() => {});
+      }
+
       return response;
     });
   };
@@ -70,7 +124,7 @@
     if (url && typeof url === 'string' && isVideoUrl(url)) {
       try {
         const fullUrl = new URL(url, window.location.href).href;
-        notify(fullUrl);
+        notify(fullUrl, { mediaType: classifyMediaUrl(fullUrl) });
       } catch { /* ignore */ }
     }
     return originalXHROpen.call(this, method, url, ...rest);
@@ -80,11 +134,18 @@
   XMLHttpRequest.prototype.send = function (...args) {
     this.addEventListener('load', function () {
       const ct = this.getResponseHeader('content-type') || '';
+
+      // Direct video/manifest content-type
       if (this._vmUrl && isVideoMimeType(ct)) {
         try {
           const fullUrl = new URL(this._vmUrl, window.location.href).href;
-          notify(fullUrl);
+          notify(fullUrl, { mediaType: classifyMediaUrl(fullUrl) });
         } catch { /* ignore */ }
+      }
+
+      // Scan JSON/text responses for embedded manifest URLs
+      if ((ct.includes('json') || ct.includes('text')) && this.responseText) {
+        scanTextForVideoUrls(this.responseText);
       }
     });
     return originalXHRSend.apply(this, args);
@@ -116,12 +177,6 @@
     }
   }
 
-  function classifyMediaUrl(url) {
-    if (/\.m3u8?(\?|#|$)/i.test(url)) return 'hls';
-    if (/\.mpd(\?|#|$)/i.test(url)) return 'dash';
-    return 'direct';
-  }
-
   try { interceptSrc(videoProto, 'VIDEO'); } catch { /* may fail on some browsers */ }
   try { interceptSrc(audioProto, 'AUDIO'); } catch { /* may fail on some browsers */ }
 
@@ -146,9 +201,161 @@
     });
   }
 
+  // ── Bitmovin Player Interception ───────────────────────────────────────
+  // Bitmovin Player (used by The Great Courses / Wondrium, many others)
+  // loads video via: player.load({ dash: '...', hls: '...' })
+  // The player object is created via: new bitmovin.player.Player(container, config)
+  // Or in newer versions: bitmovin.playerx.Player()
+  //
+  // We intercept both the constructor AND the .load() / .setup() methods
+  // to extract the manifest URLs from the source config.
+
+  function extractBitmovinSource(sourceConfig) {
+    if (!sourceConfig || typeof sourceConfig !== 'object') return;
+
+    // Standard v8 source config properties
+    const urlProps = ['dash', 'hls', 'progressive', 'smooth'];
+    for (const prop of urlProps) {
+      const val = sourceConfig[prop];
+      if (typeof val === 'string' && val.length > 0) {
+        try {
+          const url = new URL(val, window.location.href).href;
+          const type = prop === 'hls' ? 'hls' : prop === 'dash' ? 'dash' : 'direct';
+          notify(url, { mediaType: type });
+        } catch { /* ignore */ }
+      }
+      // Progressive can be an array of objects with .url
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          if (typeof item === 'string') notify(item);
+          else if (item && item.url) notify(item.url);
+        }
+      }
+    }
+
+    // Player Web X (v10+) uses resources array
+    if (Array.isArray(sourceConfig.resources)) {
+      for (const res of sourceConfig.resources) {
+        if (res && res.url) {
+          notify(res.url, { mediaType: classifyMediaUrl(res.url) });
+        }
+      }
+    }
+
+    // Sometimes the source is nested under .source
+    if (sourceConfig.source) {
+      extractBitmovinSource(sourceConfig.source);
+    }
+  }
+
+  function interceptBitmovinPlayer(playerInstance) {
+    if (!playerInstance || playerInstance._vmIntercepted) return playerInstance;
+    playerInstance._vmIntercepted = true;
+
+    // Intercept .load()
+    const origLoad = playerInstance.load;
+    if (typeof origLoad === 'function') {
+      playerInstance.load = function (sourceConfig, ...rest) {
+        extractBitmovinSource(sourceConfig);
+        return origLoad.call(this, sourceConfig, ...rest);
+      };
+    }
+
+    // Intercept .setup() (older API)
+    const origSetup = playerInstance.setup;
+    if (typeof origSetup === 'function') {
+      playerInstance.setup = function (config, ...rest) {
+        if (config && config.source) {
+          extractBitmovinSource(config.source);
+        }
+        extractBitmovinSource(config);
+        return origSetup.call(this, config, ...rest);
+      };
+    }
+
+    // Listen for events that reveal the source
+    try {
+      if (typeof playerInstance.on === 'function') {
+        playerInstance.on('sourceloaded', () => {
+          try {
+            const source = playerInstance.getSource?.() || playerInstance.getConfig?.()?.source;
+            if (source) extractBitmovinSource(source);
+          } catch { /* ignore */ }
+        });
+      }
+    } catch { /* ignore */ }
+
+    // Check if source is already loaded
+    try {
+      const currentSource = playerInstance.getSource?.() || playerInstance.getConfig?.()?.source;
+      if (currentSource) extractBitmovinSource(currentSource);
+    } catch { /* ignore */ }
+
+    return playerInstance;
+  }
+
+  // Poll for bitmovin.player namespace
+  const checkBitmovin = setInterval(() => {
+    if (typeof window.bitmovin !== 'undefined' && window.bitmovin.player) {
+      // Intercept the Player constructor
+      const origPlayerNs = window.bitmovin.player;
+      if (origPlayerNs.Player && !origPlayerNs._vmPatched) {
+        origPlayerNs._vmPatched = true;
+        const OrigPlayer = origPlayerNs.Player;
+
+        origPlayerNs.Player = function (container, config, ...rest) {
+          // Extract source from initial config if present
+          if (config && config.source) {
+            extractBitmovinSource(config.source);
+          }
+
+          const instance = new OrigPlayer(container, config, ...rest);
+          interceptBitmovinPlayer(instance);
+          return instance;
+        };
+
+        // Preserve prototype and static properties
+        origPlayerNs.Player.prototype = OrigPlayer.prototype;
+        Object.keys(OrigPlayer).forEach(key => {
+          try { origPlayerNs.Player[key] = OrigPlayer[key]; } catch { /* ignore */ }
+        });
+      }
+      clearInterval(checkBitmovin);
+    }
+  }, 200);
+  setTimeout(() => clearInterval(checkBitmovin), 60000);
+
+  // Also try to find already-existing Bitmovin player instances in the DOM
+  const findExistingBitmovin = setInterval(() => {
+    // Bitmovin adds a specific class/id pattern to its player container
+    document.querySelectorAll('[id*="bitmovin"], [class*="bitmovin"], [data-bitmovin]').forEach((el) => {
+      // The player instance is sometimes stored on the element
+      if (el._player || el.player) {
+        interceptBitmovinPlayer(el._player || el.player);
+      }
+    });
+
+    // Also check the global player registry that Bitmovin maintains
+    try {
+      if (window.bitmovin && window.bitmovin.player && window.bitmovin.player.Player) {
+        // Some sites store player instance globally
+        for (const key of Object.keys(window)) {
+          try {
+            const val = window[key];
+            if (val && typeof val === 'object' && typeof val.getSource === 'function' && typeof val.load === 'function') {
+              const source = val.getSource();
+              if (source) extractBitmovinSource(source);
+              interceptBitmovinPlayer(val);
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+  }, 2000);
+  setTimeout(() => clearInterval(findExistingBitmovin), 60000);
+
   // ── Monitor HLS.js instances ───────────────────────────────────────────
 
-  // HLS.js stores manifest URLs that we can intercept
   const checkHlsJs = setInterval(() => {
     if (typeof window.Hls === 'function') {
       const OrigHls = window.Hls;
@@ -177,7 +384,6 @@
         const OrigMediaPlayer = window.dashjs.MediaPlayer;
         const origCreate = OrigMediaPlayer().create;
         if (origCreate) {
-          // Intercept attachSource to capture DASH manifest URLs
           const origAttachSource = origCreate.prototype?.attachSource;
           if (origAttachSource) {
             origCreate.prototype.attachSource = function(src) {
@@ -197,66 +403,94 @@
   }, 500);
   setTimeout(() => clearInterval(checkDashJs), 30000);
 
-  // ── MediaSource / SourceBuffer Interception ────────────────────────────
-  // This is CRITICAL for paywall sites. Sites like The Great Courses, Udemy,
-  // Netflix (non-DRM), etc. use MediaSource Extensions (MSE) to feed video
-  // data into a <video> element via a blob: URL. The actual stream URLs are
-  // fetched via fetch/XHR and then appended to a SourceBuffer.
-  //
-  // We intercept:
-  // 1. URL.createObjectURL(mediaSource) - to track which blob URL maps to
-  //    which MediaSource, so we can associate <video>.src blob URLs with
-  //    detected streams.
-  // 2. MediaSource.addSourceBuffer() - to know which MIME types are being used.
-  // 3. We already intercept fetch/XHR above to capture the actual segment URLs.
+  // ── Shaka Player Interception ──────────────────────────────────────────
+  // Shaka Player (Google's open source player) is used by many streaming sites
 
-  // Track MediaSource <-> blob URL associations
+  const checkShaka = setInterval(() => {
+    if (typeof window.shaka !== 'undefined' && window.shaka.Player) {
+      const OrigShaka = window.shaka.Player;
+      const origLoad = OrigShaka.prototype.load;
+      if (origLoad) {
+        OrigShaka.prototype.load = function (manifestUri, ...rest) {
+          if (manifestUri && typeof manifestUri === 'string') {
+            try {
+              const fullUrl = new URL(manifestUri, window.location.href).href;
+              notify(fullUrl, { mediaType: classifyMediaUrl(fullUrl) });
+            } catch { /* ignore */ }
+          }
+          return origLoad.call(this, manifestUri, ...rest);
+        };
+      }
+      clearInterval(checkShaka);
+    }
+  }, 500);
+  setTimeout(() => clearInterval(checkShaka), 30000);
+
+  // ── JW Player Interception ─────────────────────────────────────────────
+
+  const checkJWPlayer = setInterval(() => {
+    if (typeof window.jwplayer === 'function') {
+      const origJW = window.jwplayer;
+      window.jwplayer = function (...args) {
+        const instance = origJW.apply(this, args);
+        if (instance && typeof instance.setup === 'function' && !instance._vmPatched) {
+          instance._vmPatched = true;
+          const origSetup = instance.setup;
+          instance.setup = function (config) {
+            if (config) {
+              // JW Player uses playlist[].sources[].file or playlist[].file
+              const items = config.playlist || (config.file ? [config] : []);
+              for (const item of items) {
+                if (item.file) notify(item.file, { mediaType: classifyMediaUrl(item.file) });
+                if (item.sources) {
+                  for (const s of item.sources) {
+                    if (s.file) notify(s.file, { mediaType: classifyMediaUrl(s.file) });
+                  }
+                }
+              }
+            }
+            return origSetup.call(this, config);
+          };
+        }
+        return instance;
+      };
+      Object.keys(origJW).forEach(k => { try { window.jwplayer[k] = origJW[k]; } catch {} });
+      clearInterval(checkJWPlayer);
+    }
+  }, 500);
+  setTimeout(() => clearInterval(checkJWPlayer), 30000);
+
+  // ── MediaSource / SourceBuffer Interception ────────────────────────────
+
   const mediaSourceBlobs = new WeakMap();
   const blobToSourceInfo = new Map();
 
-  // Intercept URL.createObjectURL to track MediaSource blob URLs
   const origCreateObjectURL = URL.createObjectURL;
   URL.createObjectURL = function (obj) {
     const blobUrl = origCreateObjectURL.call(this, obj);
-
     if (obj instanceof MediaSource) {
       mediaSourceBlobs.set(obj, blobUrl);
-      blobToSourceInfo.set(blobUrl, {
-        mimeTypes: [],
-        created: Date.now(),
-      });
+      blobToSourceInfo.set(blobUrl, { mimeTypes: [], created: Date.now() });
     }
-
     return blobUrl;
   };
 
-  // Intercept MediaSource.addSourceBuffer to track MIME types
   const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function (mimeType) {
     const blobUrl = mediaSourceBlobs.get(this);
     if (blobUrl && blobToSourceInfo.has(blobUrl)) {
       blobToSourceInfo.get(blobUrl).mimeTypes.push(mimeType);
     }
-
-    const sourceBuffer = origAddSourceBuffer.call(this, mimeType);
-    return sourceBuffer;
+    return origAddSourceBuffer.call(this, mimeType);
   };
 
-  // ── Monitor <video> elements for blob: src and resolve them ────────────
-  // When a <video> has a blob: src backed by MSE, we already captured the
-  // actual stream URLs via fetch/XHR interception. But we also want to
-  // track which <video> elements are using MSE so we can report them with
-  // proper metadata (resolution, duration).
-
+  // Monitor <video> elements for blob: src
   const blobVideoObserver = setInterval(() => {
     document.querySelectorAll('video').forEach((video) => {
       if (video.src && video.src.startsWith('blob:') && !video._vmTracked) {
         video._vmTracked = true;
-
         const info = blobToSourceInfo.get(video.src);
         if (info) {
-          // This video is using MSE - we have the real URLs from fetch/XHR intercepts
-          // Add metadata if available
           const addMeta = () => {
             if (video.videoWidth && video.videoHeight) {
               window.postMessage({
@@ -268,28 +502,22 @@
               }, '*');
             }
           };
-
-          if (video.readyState >= 1) {
-            addMeta();
-          } else {
-            video.addEventListener('loadedmetadata', addMeta, { once: true });
-          }
+          if (video.readyState >= 1) addMeta();
+          else video.addEventListener('loadedmetadata', addMeta, { once: true });
         }
       }
     });
   }, 1000);
-  setTimeout(() => clearInterval(blobVideoObserver), 300000); // stop after 5 minutes
+  setTimeout(() => clearInterval(blobVideoObserver), 300000);
 
-  // ── Intercept video.js (used by many course/LMS platforms) ──────────────
+  // ── Intercept video.js ─────────────────────────────────────────────────
 
   const checkVideoJs = setInterval(() => {
     if (typeof window.videojs === 'function') {
       const origVideojs = window.videojs;
       window.videojs = function (...args) {
         const player = origVideojs.apply(this, args);
-
         try {
-          // Listen for source changes
           player.on('loadstart', function () {
             const tech = player.tech({ IWillNotUseThisInPlugins: true });
             if (tech && tech.currentSource_) {
@@ -300,16 +528,12 @@
             }
           });
         } catch { /* ignore */ }
-
         return player;
       };
-
-      // Copy all static properties
       for (const key of Object.keys(origVideojs)) {
         window.videojs[key] = origVideojs[key];
       }
       Object.setPrototypeOf(window.videojs, origVideojs);
-
       clearInterval(checkVideoJs);
     }
   }, 500);
@@ -320,14 +544,8 @@
   function scanScripts() {
     document.querySelectorAll('script:not([src])').forEach((script) => {
       const text = script.textContent;
-      if (!text || text.length > 500000) return; // skip very large scripts
-
-      // Match URLs that look like video files
-      const urlRegex = /["'](https?:\/\/[^"'\s]+\.(mp4|webm|m3u8?|mpd|m4v|ts)(\?[^"'\s]*)?)["']/gi;
-      let match;
-      while ((match = urlRegex.exec(text)) !== null) {
-        notify(match[1]);
-      }
+      if (!text || text.length > 500000) return;
+      scanTextForVideoUrls(text);
     });
   }
 
@@ -336,5 +554,9 @@
   } else {
     scanScripts();
   }
+
+  // Re-scan after a delay for dynamically added scripts
+  setTimeout(scanScripts, 3000);
+  setTimeout(scanScripts, 8000);
 
 })();

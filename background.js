@@ -240,14 +240,25 @@ chrome.webRequest.onHeadersReceived.addListener(
 // When the browser sends a request for a video resource, it includes cookies,
 // auth tokens, and referer. We capture these so we can re-use them when
 // downloading HLS/DASH segments from the service worker.
+//
+// IMPORTANT: We capture headers broadly (not just for video URLs) because
+// paywall sites like The Great Courses use API endpoints that don't match
+// video URL patterns — the auth tokens on those requests are the same ones
+// needed for the CDN segment requests.
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
     const url = details.url;
 
+    // Capture headers for ANY request to the page's domain, plus known CDN
+    // and streaming domains, plus video/manifest URLs
     const isStream = HLS_PATTERNS.test(url) || DASH_PATTERNS.test(url)
-      || VIDEO_EXTENSIONS.test(url) || /\.(ts|fmp4|m4s|m4f|m4v|mp4|cmfv|cmfa)(\?|$)/i.test(url);
-    if (!isStream) return;
+      || VIDEO_EXTENSIONS.test(url)
+      || /\.(ts|fmp4|m4s|m4f|m4v|mp4|cmfv|cmfa)(\?|$)/i.test(url);
+    const isApiOrPage = details.type === 'xmlhttprequest' || details.type === 'other';
+    const isKnownCdn = /akamaihd|cloudfront|fastly|cdn|stream|video|bitmovin|brightcove|jwplayer|wondrium|thegreatcourses/i.test(url);
+
+    if (!isStream && !isApiOrPage && !isKnownCdn) return;
 
     const captured = {};
     if (details.requestHeaders) {
@@ -281,7 +292,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   ['requestHeaders']
 );
 
-// Also monitor requests by URL pattern for HLS/DASH that may not have proper content-type
+// Also monitor requests by URL pattern for HLS/DASH that may not have proper content-type.
+// We use broad URL patterns because paywall sites often serve manifests from
+// API endpoints that don't have .m3u8/.mpd extensions (e.g., /api/v1/streams/...).
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0) return;
@@ -293,7 +306,49 @@ chrome.webRequest.onBeforeRequest.addListener(
       registerVideo(details.tabId, { url, type: 'dash' });
     }
   },
-  { urls: ['*://*/*.m3u8*', '*://*/*.m3u*', '*://*/*.mpd*'] }
+  { urls: [
+    '*://*/*.m3u8*', '*://*/*.m3u*', '*://*/*.mpd*',
+    // Broader patterns for CDN-style URLs without extensions
+    '*://*/*.m3u8', '*://*/*.mpd',
+    // Catch segment files too (so we know a stream is active)
+    '*://*/*.ts?*',
+    '*://*/*.m4s*',
+    '*://*/*.fmp4*',
+  ] }
+);
+
+// ── Broad content-type based detection ──────────────────────────────────────
+// Some sites serve manifests with proper content-type but unusual URLs.
+// We also want to detect when segment files (.ts, .m4s) are being fetched
+// to infer that a stream is active even if we missed the manifest.
+const SEGMENT_PATTERNS = /\.(ts|m4s|fmp4|cmfv|cmfa|m4f)(\?|$)/i;
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    if (details.type === 'main_frame') return;
+
+    const url = details.url;
+    let contentType = '';
+    if (details.responseHeaders) {
+      for (const h of details.responseHeaders) {
+        if (h.name.toLowerCase() === 'content-type') {
+          contentType = h.value || '';
+          break;
+        }
+      }
+    }
+
+    // Detect manifests served with proper MIME but no extension match
+    // (e.g., API endpoints like /api/stream/video123 that return application/vnd.apple.mpegurl)
+    if (/mpegurl/i.test(contentType) && !HLS_PATTERNS.test(url)) {
+      registerVideo(details.tabId, { url, type: 'hls', contentType });
+    } else if (/dash\+xml/i.test(contentType) && !DASH_PATTERNS.test(url)) {
+      registerVideo(details.tabId, { url, type: 'dash', contentType });
+    }
+  },
+  { urls: ['<all_urls>'] },
+  ['responseHeaders']
 );
 
 // ── Tab lifecycle ────────────────────────────────────────────────────────────
