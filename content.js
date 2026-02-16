@@ -197,11 +197,34 @@
   // Listen for messages from injected page script
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
+
     if (event.data && event.data.type === 'VIDEOMANCER_DETECTED') {
       const { url, mediaType, quality, resolution } = event.data;
       if (url && !url.startsWith('blob:')) {
         registerUrl(url, { type: mediaType, quality, resolution });
       }
+    }
+
+    // Handle blob video metadata (from MSE/MediaSource interception)
+    if (event.data && event.data.type === 'VIDEOMANCER_BLOB_VIDEO') {
+      const { blobUrl, resolution, duration, mimeTypes } = event.data;
+      // Notify background that a blob-backed video was found with these properties
+      // The actual downloadable URLs were already captured via fetch/XHR interception
+      chrome.runtime.sendMessage({
+        action: 'registerVideo',
+        video: {
+          url: blobUrl,
+          type: 'mse-blob',
+          quality: resolution ? (parseInt(resolution.split('x')[1]) + 'p') : null,
+          resolution,
+          duration,
+          filename: document.title || 'video',
+          pageUrl: window.location.href,
+          pageTitle: document.title,
+          mimeTypes,
+          isBlobVideo: true,
+        },
+      }).catch(() => {});
     }
   });
 

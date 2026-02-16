@@ -173,9 +173,9 @@
   }
 
   async function handleHLSDownload(video) {
-    // Fetch available qualities
+    // Fetch available qualities (pass tabId for authenticated fetch)
     chrome.runtime.sendMessage(
-      { action: 'getHLSQualities', url: video.url },
+      { action: 'getHLSQualities', url: video.url, tabId: currentTabId },
       (response) => {
         if (response && response.qualities && response.qualities.length > 0) {
           showQualityPicker(video, response.qualities, (selectedUrl) => {
@@ -191,7 +191,7 @@
 
   async function handleDASHDownload(video) {
     chrome.runtime.sendMessage(
-      { action: 'getDASHQualities', url: video.url },
+      { action: 'getDASHQualities', url: video.url, tabId: currentTabId },
       (response) => {
         if (response && response.qualities && response.qualities.length > 0) {
           showQualityPicker(video, response.qualities, (selectedId) => {

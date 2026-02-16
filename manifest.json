@@ -9,7 +9,9 @@
     "downloads",
     "webRequest",
     "tabs",
-    "notifications"
+    "notifications",
+    "cookies",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "<all_urls>"

@@ -2,11 +2,19 @@
  * VideoMancer - Background Service Worker
  * Intercepts network requests to detect video streams (MP4, WebM, HLS, DASH)
  * and manages the detected video registry per tab.
+ *
+ * Paywall/auth support: captures request headers (cookies, auth tokens, referer)
+ * from the original page context and forwards them when downloading HLS/DASH
+ * segments, enabling downloads from subscription/paywall sites.
  */
 
 // ── Per-tab video store ──────────────────────────────────────────────────────
 // Map<tabId, Map<videoId, VideoEntry>>
 const tabVideos = new Map();
+
+// ── Per-tab captured request headers (for authenticated downloads) ───────────
+// Map<tabId, { cookies, referer, origin, authorization, customHeaders }>
+const tabRequestHeaders = new Map();
 
 // Video entry structure:
 // { id, url, type, quality, size, filename, pageUrl, pageTitle, timestamp, headers }
@@ -228,6 +236,51 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders']
 );
 
+// ── Capture outgoing request headers for auth-gated streams ──────────────────
+// When the browser sends a request for a video resource, it includes cookies,
+// auth tokens, and referer. We capture these so we can re-use them when
+// downloading HLS/DASH segments from the service worker.
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    const url = details.url;
+
+    const isStream = HLS_PATTERNS.test(url) || DASH_PATTERNS.test(url)
+      || VIDEO_EXTENSIONS.test(url) || /\.(ts|fmp4|m4s|m4f|m4v|mp4|cmfv|cmfa)(\?|$)/i.test(url);
+    if (!isStream) return;
+
+    const captured = {};
+    if (details.requestHeaders) {
+      for (const h of details.requestHeaders) {
+        const name = h.name.toLowerCase();
+        if (name === 'cookie') captured.cookie = h.value;
+        if (name === 'authorization') captured.authorization = h.value;
+        if (name === 'referer') captured.referer = h.value;
+        if (name === 'origin') captured.origin = h.value;
+        // Capture custom tokens often used by CDNs
+        if (name.startsWith('x-') || name === 'range') {
+          if (!captured.custom) captured.custom = {};
+          captured.custom[h.name] = h.value;
+        }
+      }
+    }
+
+    // Also capture the page URL as referer fallback
+    if (!captured.referer) {
+      try {
+        const urlObj = new URL(url);
+        captured.referer = urlObj.origin + '/';
+      } catch { /* ignore */ }
+    }
+
+    // Merge with existing (don't overwrite if we already have richer data)
+    const existing = tabRequestHeaders.get(details.tabId) || {};
+    tabRequestHeaders.set(details.tabId, { ...existing, ...captured });
+  },
+  { urls: ['<all_urls>'] },
+  ['requestHeaders']
+);
+
 // Also monitor requests by URL pattern for HLS/DASH that may not have proper content-type
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -247,11 +300,13 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabVideos.delete(tabId);
+  tabRequestHeaders.delete(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading') {
     tabVideos.delete(tabId);
+    tabRequestHeaders.delete(tabId);
     updateBadge(tabId);
   }
 });
@@ -307,10 +362,14 @@ const messageHandlers = {
     }
   },
 
-  // Get available qualities for HLS
+  // Get available qualities for HLS (with auth)
   getHLSQualities: async (msg) => {
     try {
-      const response = await fetch(msg.url);
+      const tabId = msg.tabId;
+      if (tabId) await ensureAuthHeaders(tabId, msg.url);
+      const response = tabId
+        ? await authenticatedFetch(msg.url, tabId)
+        : await fetch(msg.url);
       const text = await response.text();
       return { qualities: parseM3U8Master(text, msg.url) };
     } catch (err) {
@@ -318,10 +377,14 @@ const messageHandlers = {
     }
   },
 
-  // Get available qualities for DASH
+  // Get available qualities for DASH (with auth)
   getDASHQualities: async (msg) => {
     try {
-      const response = await fetch(msg.url);
+      const tabId = msg.tabId;
+      if (tabId) await ensureAuthHeaders(tabId, msg.url);
+      const response = tabId
+        ? await authenticatedFetch(msg.url, tabId)
+        : await fetch(msg.url);
       const text = await response.text();
       return { qualities: parseMPD(text, msg.url) };
     } catch (err) {
@@ -489,9 +552,128 @@ function parseMPD(content, baseUrl) {
 
 // ── Download Functions ───────────────────────────────────────────────────────
 
-async function downloadDirect(video) {
+/**
+ * Build fetch options with captured auth headers from the original page session.
+ * This is the KEY mechanism for paywall/subscription site support:
+ * - Forwards cookies so CDN thinks request comes from authenticated session
+ * - Forwards Authorization headers (Bearer tokens, Basic auth, etc.)
+ * - Forwards Referer so CDN doesn't reject the request as hotlinking
+ * - Forwards Origin for CORS-protected streams
+ * - Forwards custom X-* headers that CDNs use for token validation
+ */
+function buildAuthHeaders(tabId, targetUrl) {
+  const captured = tabRequestHeaders.get(tabId) || {};
+  const headers = {};
+
+  // Forward cookie for same-origin and same-domain segment requests
+  if (captured.cookie) {
+    headers['Cookie'] = captured.cookie;
+  }
+
+  // Forward authorization (Bearer/Basic tokens used by APIs like Wondrium, Udemy, etc.)
+  if (captured.authorization) {
+    headers['Authorization'] = captured.authorization;
+  }
+
+  // Forward referer (CDNs like Akamai/CloudFront check this to prevent hotlinking)
+  if (captured.referer) {
+    headers['Referer'] = captured.referer;
+  }
+
+  // Forward origin for CORS
+  if (captured.origin) {
+    headers['Origin'] = captured.origin;
+  }
+
+  // Forward custom CDN token headers (e.g., x-playback-session-id, x-custom-token)
+  if (captured.custom) {
+    for (const [name, value] of Object.entries(captured.custom)) {
+      if (name.toLowerCase() !== 'range') { // don't forward range headers
+        headers[name] = value;
+      }
+    }
+  }
+
+  return headers;
+}
+
+/**
+ * Fetch with authentication — wraps fetch() with captured headers.
+ * Falls back to unauthenticated fetch if authenticated request fails.
+ */
+async function authenticatedFetch(url, tabId, extraOpts = {}) {
+  const authHeaders = buildAuthHeaders(tabId, url);
+  const hasAuth = Object.keys(authHeaders).length > 0;
+
+  const fetchOpts = {
+    ...extraOpts,
+    headers: { ...authHeaders, ...(extraOpts.headers || {}) },
+    credentials: 'include', // include cookies for same-origin requests
+  };
+
+  try {
+    const resp = await fetch(url, fetchOpts);
+    if (resp.ok) return resp;
+
+    // If auth fetch got 403/401, try without auth headers (the URL itself may have tokens)
+    if (hasAuth && (resp.status === 403 || resp.status === 401)) {
+      return await fetch(url, { credentials: 'include' });
+    }
+    return resp;
+  } catch (err) {
+    // If authenticated fetch threw a network error (CORS), retry without custom headers
+    if (hasAuth) {
+      return await fetch(url, { credentials: 'include' });
+    }
+    throw err;
+  }
+}
+
+/**
+ * Get cookies from chrome.cookies API for a specific URL.
+ * Used as a fallback when we didn't capture headers from webRequest.
+ */
+async function getCookiesForUrl(url) {
+  try {
+    const cookies = await chrome.cookies.getAll({ url });
+    if (cookies.length === 0) return null;
+    return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ensure we have auth headers for a tab. If webRequest didn't capture them,
+ * fall back to the chrome.cookies API.
+ */
+async function ensureAuthHeaders(tabId, url) {
+  const existing = tabRequestHeaders.get(tabId);
+  if (existing && existing.cookie) return; // already have cookies
+
+  const cookieStr = await getCookiesForUrl(url);
+  if (cookieStr) {
+    const current = tabRequestHeaders.get(tabId) || {};
+    tabRequestHeaders.set(tabId, { ...current, cookie: cookieStr });
+  }
+
+  // Also set referer from the video URL's origin
+  if (!existing?.referer) {
+    try {
+      const current = tabRequestHeaders.get(tabId) || {};
+      const tab = await chrome.tabs.get(tabId);
+      if (tab?.url) {
+        tabRequestHeaders.set(tabId, { ...current, referer: tab.url });
+      }
+    } catch { /* tab may not exist */ }
+  }
+}
+
+async function downloadDirect(video, tabId) {
   const filename = sanitizeFilename(video.filename || 'video.mp4');
 
+  // For direct downloads, chrome.downloads will send cookies automatically
+  // if the user is authenticated in the browser session
   const downloadId = await chrome.downloads.download({
     url: video.url,
     filename: filename,
@@ -502,8 +684,12 @@ async function downloadDirect(video) {
 }
 
 async function downloadHLS(video, tabId) {
-  // First fetch the m3u8 to check if it's a master or media playlist
-  const response = await fetch(video.url);
+  // Ensure we have auth headers before starting
+  await ensureAuthHeaders(tabId, video.url);
+
+  // First fetch the m3u8 with authentication
+  const response = await authenticatedFetch(video.url, tabId);
+  if (!response.ok) return { error: `Failed to fetch manifest: HTTP ${response.status}` };
   const content = await response.text();
   const qualities = parseM3U8Master(content, video.url);
 
@@ -515,38 +701,67 @@ async function downloadHLS(video, tabId) {
 
     if (!selected) return { error: 'Quality not found' };
 
-    // Fetch the media playlist
-    const mediaResp = await fetch(selected.url);
+    // Fetch the media playlist with authentication
+    const mediaResp = await authenticatedFetch(selected.url, tabId);
+    if (!mediaResp.ok) return { error: `Failed to fetch media playlist: HTTP ${mediaResp.status}` };
     const mediaContent = await mediaResp.text();
-    return await downloadHLSSegments(mediaContent, selected.url, video);
+    return await downloadHLSSegments(mediaContent, selected.url, video, tabId);
   }
 
   // It's already a media playlist
-  return await downloadHLSSegments(content, video.url, video);
+  return await downloadHLSSegments(content, video.url, video, tabId);
 }
 
-async function downloadHLSSegments(content, baseUrl, video) {
+async function downloadHLSSegments(content, baseUrl, video, tabId) {
   const segments = parseM3U8Segments(content, baseUrl);
   if (segments.length === 0) return { error: 'No segments found' };
+
+  // Parse encryption key if present (many paywall sites use AES-128 encrypted HLS)
+  const keyInfo = parseM3U8Key(content, baseUrl);
+
+  let decryptionKey = null;
+  if (keyInfo && keyInfo.uri) {
+    try {
+      const keyResp = await authenticatedFetch(keyInfo.uri, tabId);
+      if (keyResp.ok) {
+        decryptionKey = await keyResp.arrayBuffer();
+      }
+    } catch { /* decryption not available */ }
+  }
 
   // Notify progress
   broadcastProgress(video.id, 0, segments.length);
 
   const chunks = [];
   const batchSize = settings.maxConcurrentDownloads || 3;
+  let failureCount = 0;
 
   for (let i = 0; i < segments.length; i += batchSize) {
     const batch = segments.slice(i, i + batchSize);
     const results = await Promise.all(
       batch.map(async (seg) => {
-        const resp = await fetch(seg.url);
-        if (!resp.ok) throw new Error(`Failed to fetch segment: ${resp.status}`);
-        return await resp.arrayBuffer();
+        // Each segment request uses authenticated fetch with cookies/tokens
+        const resp = await authenticatedFetch(seg.url, tabId);
+        if (!resp.ok) {
+          failureCount++;
+          if (failureCount > 5) throw new Error(`Too many segment failures (${resp.status})`);
+          return null; // skip this segment
+        }
+        let data = await resp.arrayBuffer();
+
+        // If HLS uses AES-128 encryption, decrypt segment
+        if (decryptionKey && keyInfo) {
+          data = await decryptSegment(data, decryptionKey, keyInfo.iv, i + batch.indexOf(seg));
+        }
+
+        return data;
       })
     );
-    chunks.push(...results);
+    chunks.push(...results.filter(Boolean));
     broadcastProgress(video.id, Math.min(i + batchSize, segments.length), segments.length);
   }
+
+  if (chunks.length === 0) return { error: 'No segments downloaded — authentication may have expired' };
 
   // Merge all segments into one blob
   const merged = new Blob(chunks, { type: 'video/mp2t' });
@@ -569,11 +784,11 @@ async function downloadHLSSegments(content, baseUrl, video) {
 }
 
 async function downloadDASH(video, tabId) {
-  // For DASH, we download the selected representation directly
-  // A full implementation would merge segments; here we provide the manifest URL
-  // and let the user pick a representation
+  // Ensure we have auth headers before starting
+  await ensureAuthHeaders(tabId, video.url);
 
-  const response = await fetch(video.url);
+  const response = await authenticatedFetch(video.url, tabId);
+  if (!response.ok) return { error: `Failed to fetch MPD: HTTP ${response.status}` };
   const content = await response.text();
   const qualities = parseMPD(content, video.url);
 
@@ -583,29 +798,29 @@ async function downloadDASH(video, tabId) {
   if (video.selectedQuality) {
     const selected = qualities.find(q => q.url === video.selectedQuality || q.id === video.selectedQuality);
     if (selected && selected.url && selected.url !== video.url) {
-      return await downloadDirect({ ...video, url: selected.url, filename: video.filename });
+      return await downloadDirect({ ...video, url: selected.url, filename: video.filename }, tabId);
     }
 
     // Handle SegmentTemplate-based DASH
     if (selected && selected.segmentTemplate) {
-      return await downloadDASHSegments(selected, video);
+      return await downloadDASHSegments(selected, video, tabId);
     }
   }
 
   // Default: download best quality
   const best = qualities.find(q => q.isVideo && q.url && q.url !== video.url) || qualities[0];
   if (best && best.url && best.url !== video.url) {
-    return await downloadDirect({ ...video, url: best.url });
+    return await downloadDirect({ ...video, url: best.url }, tabId);
   }
 
   if (best && best.segmentTemplate) {
-    return await downloadDASHSegments(best, video);
+    return await downloadDASHSegments(best, video, tabId);
   }
 
   return { error: 'Could not resolve DASH segments' };
 }
 
-async function downloadDASHSegments(representation, video) {
+async function downloadDASHSegments(representation, video, tabId) {
   const tmpl = representation.segmentTemplate;
   if (!tmpl || !tmpl.media) return { error: 'No segment template' };
 
@@ -625,14 +840,14 @@ async function downloadDASHSegments(representation, video) {
   const chunks = [];
   const batchSize = settings.maxConcurrentDownloads || 3;
 
-  // Download init segment if available
+  // Download init segment if available (with auth)
   if (tmpl.initialization) {
     const initUrl = resolveUrl(
       video.url,
       tmpl.initialization.replace('$RepresentationID$', representation.id)
     );
     try {
-      const resp = await fetch(initUrl);
+      const resp = await authenticatedFetch(initUrl, tabId);
       if (resp.ok) chunks.push(await resp.arrayBuffer());
     } catch { /* optional */ }
   }
@@ -643,7 +858,7 @@ async function downloadDASHSegments(representation, video) {
     try {
       const results = await Promise.all(
         batch.map(async (url) => {
-          const resp = await fetch(url);
+          const resp = await authenticatedFetch(url, tabId);
           if (!resp.ok) throw new Error('Segment 404');
           return await resp.arrayBuffer();
         })
@@ -674,6 +889,47 @@ async function downloadDASHSegments(representation, video) {
 
   setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
   return { ok: true, downloadId, segmentCount: chunks.length };
+}
+
+// ── HLS AES-128 Decryption ───────────────────────────────────────────────────
+// Many paywall sites (Wondrium, Udemy, Pluralsight, etc.) encrypt HLS segments
+// with AES-128-CBC. We parse the #EXT-X-KEY tag and decrypt each segment.
+
+function parseM3U8Key(content, baseUrl) {
+  const keyMatch = content.match(/#EXT-X-KEY:METHOD=AES-128,URI="([^"]+)"(?:,IV=0x([0-9a-fA-F]+))?/);
+  if (!keyMatch) return null;
+  return {
+    method: 'AES-128',
+    uri: resolveUrl(baseUrl, keyMatch[1]),
+    iv: keyMatch[2] || null, // null = use segment sequence number
+  };
+}
+
+async function decryptSegment(encryptedData, keyBuffer, ivHex, segmentIndex) {
+  try {
+    const key = await crypto.subtle.importKey(
+      'raw', keyBuffer, { name: 'AES-CBC' }, false, ['decrypt']
+    );
+
+    // IV: use explicit IV if provided, otherwise use segment index (per HLS spec)
+    let iv;
+    if (ivHex) {
+      iv = new Uint8Array(ivHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+    } else {
+      iv = new Uint8Array(16);
+      const view = new DataView(iv.buffer);
+      view.setUint32(12, segmentIndex); // big-endian segment number as IV
+    }
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-CBC', iv }, key, encryptedData
+    );
+
+    return decrypted;
+  } catch {
+    // If decryption fails, return original data (may be unencrypted or different cipher)
+    return encryptedData;
+  }
 }
 
 function broadcastProgress(videoId, current, total) {
