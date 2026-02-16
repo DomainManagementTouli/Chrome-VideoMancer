@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "VideoMancer",
+  "version": "1.0.0",
+  "description": "Detect and download videos from any web page. Supports HLS, DASH, MP4, WebM, and 1000+ sites.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "downloads",
+    "webRequest",
+    "tabs",
+    "notifications",
+    "cookies",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "ui/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_ui": {
+    "page": "ui/options.html",
+    "open_in_tab": true
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/*", "injected.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
