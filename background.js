@@ -484,6 +484,24 @@ function parseM3U8Master(content, baseUrl) {
   const lines = content.split('\n').map(l => l.trim());
   const qualities = [];
 
+  // First pass: collect #EXT-X-MEDIA audio renditions mapped by GROUP-ID
+  // These are used by demuxed HLS streams (separate video + audio playlists)
+  // e.g. thegreatcourses.com / Wondrium streams use this pattern
+  const audioGroups = {}; // { groupId: uri }
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-MEDIA:')) {
+      const typeMatch = line.match(/TYPE=([A-Z-]+)/);
+      if (typeMatch && typeMatch[1] === 'AUDIO') {
+        const groupMatch = line.match(/GROUP-ID="([^"]+)"/);
+        const uriMatch = line.match(/URI="([^"]+)"/);
+        if (groupMatch && uriMatch && !audioGroups[groupMatch[1]]) {
+          audioGroups[groupMatch[1]] = resolveUrl(baseUrl, uriMatch[1]);
+        }
+      }
+    }
+  }
+
+  // Second pass: parse #EXT-X-STREAM-INF video variants
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line.startsWith('#EXT-X-STREAM-INF:')) {
@@ -491,6 +509,8 @@ function parseM3U8Master(content, baseUrl) {
       const bwMatch = attrs.match(/BANDWIDTH=(\d+)/);
       const resMatch = attrs.match(/RESOLUTION=(\d+x\d+)/);
       const nameMatch = attrs.match(/NAME="([^"]+)"/);
+      // AUDIO attribute links this variant to an audio rendition group
+      const audioMatch = attrs.match(/AUDIO="([^"]+)"/);
 
       // Next non-comment line is the URL
       let urlLine = '';
@@ -506,12 +526,19 @@ function parseM3U8Master(content, baseUrl) {
         const resolution = resMatch ? resMatch[1] : null;
         const height = resolution ? parseInt(resolution.split('x')[1], 10) : 0;
 
+        // Resolve the audio stream URL for this variant (null if muxed)
+        const audioGroupId = audioMatch ? audioMatch[1] : null;
+        const audioUrl = audioGroupId && audioGroups[audioGroupId]
+          ? audioGroups[audioGroupId]
+          : null;
+
         qualities.push({
           url: resolveUrl(baseUrl, urlLine),
           bandwidth,
           resolution,
           height,
           label: nameMatch ? nameMatch[1] : (height ? `${height}p` : `${Math.round(bandwidth / 1000)}kbps`),
+          audioUrl, // non-null when video/audio are in separate playlists
         });
       }
     }
@@ -760,6 +787,12 @@ async function downloadHLS(video, tabId) {
     const mediaResp = await authenticatedFetch(selected.url, tabId);
     if (!mediaResp.ok) return { error: `Failed to fetch media playlist: HTTP ${mediaResp.status}` };
     const mediaContent = await mediaResp.text();
+
+    // Demuxed HLS: separate video and audio playlists (e.g. thegreatcourses.com)
+    if (selected.audioUrl) {
+      return await downloadHLSDemuxed(mediaContent, selected.url, selected.audioUrl, video, tabId);
+    }
+
     return await downloadHLSSegments(mediaContent, selected.url, video, tabId);
   }
 
@@ -836,6 +869,151 @@ async function downloadHLSSegments(content, baseUrl, video, tabId) {
   setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
 
   return { ok: true, downloadId, segmentCount: segments.length };
+}
+
+/**
+ * Download demuxed HLS streams — separate video and audio playlists.
+ *
+ * Sites like thegreatcourses.com / Wondrium use HLS master playlists with
+ * #EXT-X-MEDIA:TYPE=AUDIO pointing to a separate audio .m3u8, while each
+ * #EXT-X-STREAM-INF variant only contains the video track.  Fetching only
+ * the video playlist produces a silent file.  This function downloads both
+ * tracks concurrently and saves them as two files (_video.ts + _audio.ts).
+ *
+ * Merge with FFmpeg:
+ *   ffmpeg -i NAME_video.ts -i NAME_audio.ts -c copy output.mp4
+ */
+async function downloadHLSDemuxed(videoPlaylistContent, videoPlaylistUrl, audioPlaylistUrl, video, tabId) {
+  // Fetch the audio playlist
+  const audioResp = await authenticatedFetch(audioPlaylistUrl, tabId);
+  if (!audioResp.ok) {
+    // Graceful fallback: download video-only and surface a warning
+    const result = await downloadHLSSegments(videoPlaylistContent, videoPlaylistUrl, video, tabId);
+    return { ...result, warning: 'Audio playlist unavailable — downloaded video track only' };
+  }
+  const audioPlaylistContent = await audioResp.text();
+
+  const videoSegments = parseM3U8Segments(videoPlaylistContent, videoPlaylistUrl);
+  const audioSegments = parseM3U8Segments(audioPlaylistContent, audioPlaylistUrl);
+
+  if (videoSegments.length === 0) return { error: 'No video segments found in media playlist' };
+
+  // Parse per-stream AES-128 encryption keys (if any)
+  const videoKeyInfo = parseM3U8Key(videoPlaylistContent, videoPlaylistUrl);
+  const audioKeyInfo = parseM3U8Key(audioPlaylistContent, audioPlaylistUrl);
+
+  let videoDecryptionKey = null;
+  let audioDecryptionKey = null;
+
+  if (videoKeyInfo?.uri) {
+    try {
+      const kr = await authenticatedFetch(videoKeyInfo.uri, tabId);
+      if (kr.ok) videoDecryptionKey = await kr.arrayBuffer();
+    } catch { /* unencrypted or key unavailable */ }
+  }
+  if (audioKeyInfo?.uri) {
+    try {
+      const kr = await authenticatedFetch(audioKeyInfo.uri, tabId);
+      if (kr.ok) audioDecryptionKey = await kr.arrayBuffer();
+    } catch { /* unencrypted or key unavailable */ }
+  }
+
+  const totalSegments = videoSegments.length + audioSegments.length;
+  broadcastProgress(video.id, 0, totalSegments);
+
+  const batchSize = settings.maxConcurrentDownloads || 3;
+  let completed = 0;
+
+  // ── Download video segments ──────────────────────────────────────────────
+  const videoChunks = [];
+  let videoFailures = 0;
+
+  for (let i = 0; i < videoSegments.length; i += batchSize) {
+    const batch = videoSegments.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(async (seg, batchIdx) => {
+        const resp = await authenticatedFetch(seg.url, tabId);
+        if (!resp.ok) {
+          videoFailures++;
+          if (videoFailures > 5) throw new Error(`Too many video segment failures (HTTP ${resp.status})`);
+          return null;
+        }
+        let data = await resp.arrayBuffer();
+        if (videoDecryptionKey && videoKeyInfo) {
+          data = await decryptSegment(data, videoDecryptionKey, videoKeyInfo.iv, i + batchIdx);
+        }
+        return data;
+      })
+    );
+    videoChunks.push(...results.filter(Boolean));
+    completed += batch.length;
+    broadcastProgress(video.id, completed, totalSegments);
+  }
+
+  if (videoChunks.length === 0) return { error: 'No video segments downloaded — auth may have expired' };
+
+  // ── Download audio segments ──────────────────────────────────────────────
+  const audioChunks = [];
+  let audioFailures = 0;
+
+  for (let i = 0; i < audioSegments.length; i += batchSize) {
+    const batch = audioSegments.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(async (seg, batchIdx) => {
+        const resp = await authenticatedFetch(seg.url, tabId);
+        if (!resp.ok) {
+          audioFailures++;
+          if (audioFailures > 5) return null; // non-fatal: video still saves
+          return null;
+        }
+        let data = await resp.arrayBuffer();
+        if (audioDecryptionKey && audioKeyInfo) {
+          data = await decryptSegment(data, audioDecryptionKey, audioKeyInfo.iv, i + batchIdx);
+        }
+        return data;
+      })
+    );
+    audioChunks.push(...results.filter(Boolean));
+    completed += batch.length;
+    broadcastProgress(video.id, completed, totalSegments);
+  }
+
+  // ── Trigger downloads for both tracks ───────────────────────────────────
+  const baseName = sanitizeFilename(
+    (video.filename || 'video').replace(/\.(m3u8?|ts)$/i, '')
+  );
+
+  const videoBlob = new Blob(videoChunks, { type: 'video/mp2t' });
+  const videoBlobUrl = URL.createObjectURL(videoBlob);
+  const videoDownloadId = await chrome.downloads.download({
+    url: videoBlobUrl,
+    filename: baseName + '_video.ts',
+    saveAs: false,
+  });
+  setTimeout(() => URL.revokeObjectURL(videoBlobUrl), 60000);
+
+  let audioDownloadId = null;
+  if (audioChunks.length > 0) {
+    const audioBlob = new Blob(audioChunks, { type: 'video/mp2t' });
+    const audioBlobUrl = URL.createObjectURL(audioBlob);
+    audioDownloadId = await chrome.downloads.download({
+      url: audioBlobUrl,
+      filename: baseName + '_audio.ts',
+      saveAs: false,
+    });
+    setTimeout(() => URL.revokeObjectURL(audioBlobUrl), 60000);
+  }
+
+  return {
+    ok: true,
+    downloadId: videoDownloadId,
+    audioDownloadId,
+    segmentCount: videoChunks.length + audioChunks.length,
+    demuxed: true,
+    message: audioDownloadId
+      ? `Saved as "${baseName}_video.ts" and "${baseName}_audio.ts". Merge with: ffmpeg -i *_video.ts -i *_audio.ts -c copy output.mp4`
+      : `Saved "${baseName}_video.ts" (audio stream could not be downloaded)`,
+  };
 }
 
 async function downloadDASH(video, tabId) {

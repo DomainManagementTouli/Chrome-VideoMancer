@@ -262,6 +262,11 @@
 
         if (response && response.error) {
           showError(video.id, response.error);
+        } else if (response && response.demuxed) {
+          // Demuxed HLS: video and audio saved as separate files
+          showInfo(video.id, response.message || 'Saved as separate video + audio files');
+        } else if (response && response.warning) {
+          showInfo(video.id, response.warning);
         } else {
           // Download started
           if (card) {
@@ -299,6 +304,18 @@
     if (text) {
       text.textContent = `Error: ${message}`;
       text.style.color = '#e94560';
+    }
+    if (container) container.classList.add('active');
+  }
+
+  function showInfo(videoId, message) {
+    const fill = document.getElementById(`progress-fill-${videoId}`);
+    const text = document.getElementById(`progress-text-${videoId}`);
+    const container = document.getElementById(`progress-${videoId}`);
+    if (fill) fill.style.width = '100%';
+    if (text) {
+      text.textContent = message;
+      text.style.color = '#64b5f6';
     }
     if (container) container.classList.add('active');
   }
